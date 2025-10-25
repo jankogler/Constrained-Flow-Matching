@@ -1,0 +1,4 @@
+double_pendulum/__pycache__
+double_pendulum/results
+double_pendulum/train.pth
+double_pendulum/test.pth
