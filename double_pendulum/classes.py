@@ -1,5 +1,5 @@
 import torch
-from torch.func import jacrev, vmap
+from torch.nn.functional import normalize, pad
 from torch.nn import Linear, SiLU, Sequential
 from torchcfm.utils import torch_wrapper
 from torchdiffeq import odeint
@@ -8,7 +8,7 @@ from matplotlib import animation
 from matplotlib import pyplot as plt
 
 class ConstrainedVelocityField(torch.nn.Module):
-    def __init__(self, constraint, nu, rho, unconstrained=False, d=80):
+    def __init__(self, constraint, nu, rho, d=80):
         super(ConstrainedVelocityField, self).__init__()
         self.mlp = Sequential(
             Linear(d+5,4*d), SiLU(),
@@ -19,31 +19,26 @@ class ConstrainedVelocityField(torch.nn.Module):
         self.nu = nu
         self.rho = rho
         self.c = None
-        self.unconstrained = unconstrained
 
     def forward(self, x):
         assert self.c != None, "need to set initial state"
         # compute unconstrained velocity field
         t = x[:,-1].unsqueeze(-1)
-        vt = self.mlp(torch.cat((self.c,x), dim=1))
-        if self.unconstrained:
+        vt = self.mlp(torch.cat((self.c, x), dim=1))
+        if self.constraint == None:
             return vt
-        # compute trajectory jacobian and pinv
-        with torch.enable_grad():
-            traj = torch.cat((self.c, x[:,:-1]), dim=1).detach()
-            g = vmap(self.constraint)(traj).detach()
-            jac = vmap(jacrev(self.constraint))(traj)[:,:,4:].detach()
-            inverse_jac = torch.linalg.pinv(jac)
-
-        # output projected velocity minus normal stabilizer
-        projected_vel = vt - self.nu(t) * inverse_jac.bmm(jac.bmm(vt.unsqueeze(-1))).squeeze(-1)
-        normal_stab = self.rho(t) * inverse_jac.bmm(g.unsqueeze(-1)).squeeze(-1)
-        return projected_vel - normal_stab
+        # a = J^T @ g, shape (batch, d)
+        a = self.constraint(torch.cat((self.c, x[:,:-1]), dim=1))  # (batch, d, m) @ (batch, m, 1) -> (batch, d)
+        # compute <v, a> and ||a||^2
+        vt_dot_a = (vt * a).sum(dim=1, keepdim=True)  # shape (batch, 1)
+        # half-space projection: v - nu(t) * max{0, <v,a>} / ||a||^2 * a
+        a_coeff = self.nu(t) * torch.clamp(vt_dot_a, min=0.0) + self.rho(t) # shape (batch, 1)
+        return vt - a_coeff * a
 
     def inference(self, prior, condition):
         with torch.no_grad():
             self.c = condition
-            node = NeuralODE(torch_wrapper(self), solver="dopri5", sensitivity="adjoint", atol=1e-4, rtol=1e-4)
+            node = NeuralODE(torch_wrapper(self))
             traj = node.trajectory(prior, t_span=torch.linspace(0, 1, 2))
         return torch.cat((condition, traj[1]), dim=1).reshape(condition.shape[0], -1, 4)
 
@@ -85,23 +80,75 @@ class DoublePendulumTraj():
         sol = odeint(_derive, u0, t)
         return sol.permute(1, 0, 2)
 
-    def velocity_constraint(self, x):
-        traj = x.reshape(-1, 4)
-        loss1 = traj[:-1,0] + self.tdel * traj[:-1,1] - traj[1:,0]
-        loss2 = traj[:-1,2] + self.tdel * traj[:-1,3] - traj[1:,2]
-        return torch.cat([loss1, loss2])
-
-    def energy_constraint(self, x):
-        traj = x.reshape(-1, 4)
-        theta1, omega1, theta2, omega2 = traj.unbind(dim=1)
+    def velocity_norm(self, x):
+        traj = x.reshape(x.shape[0], -1, 4)  # (batch, T, 4)
+        theta1, omega1, theta2, omega2 = traj.unbind(dim=-1)  # each (batch, T)
+        vel1 = theta1[:,:-1] + self.tdel * omega1[:,:-1] - theta1[:,1:]
+        vel2 = theta2[:,:-1] + self.tdel * omega2[:,:-1] - theta2[:,1:]
+        return torch.norm(torch.cat((vel1, vel2), dim=1), dim=1).mean().item()
+    
+    def velocity_a(self, x):
+        traj = x.reshape(x.shape[0], -1, 4)  # (batch, T, 4)
+        theta1, omega1, theta2, omega2 = traj.unbind(dim=-1)  # each (batch, T)
+        vel1 = theta1[:,:-1] + self.tdel * omega1[:,:-1] - theta1[:,1:]
+        vel2 = theta2[:,:-1] + self.tdel * omega2[:,:-1] - theta2[:,1:]
+        pad1 = pad(vel1[:,1:], pad=(0, 1))
+        pad2 = pad(vel2[:,1:], pad=(0, 1))
+        dtheta1 = pad1 - vel1
+        dtheta2 = pad2 - vel2
+        domega1 = self.tdel * pad1
+        domega2 = self.tdel * pad2
+        Jt_g = torch.stack([dtheta1, domega1, dtheta2, domega2], dim=-1)
+        return normalize(Jt_g.reshape(x.shape[0], -1))
+    
+    def energy_norm(self, x):
+        traj = x.reshape(x.shape[0], -1, 4)  # (batch, T, 4)
+        theta1, omega1, theta2, omega2 = traj.unbind(dim=-1)  # each (batch, T)
         # Kinetic energy
-        KE = 0.5 * self.M1 * (self.L1**2) * omega1**2 + 0.5 * self.M2 * (self.L1**2 * omega1**2 + self.L2**2 * omega2**2 + 2 * self.L1 * self.L2 * omega1 * omega2 * torch.cos(theta1 - theta2))
+        KE = 0.5 * self.M1 * self.L1**2 * omega1**2 + \
+            0.5 * self.M2 * (self.L1**2 * omega1**2 + self.L2**2 * omega2**2 + 
+                        2 * self.L1 * self.L2 * omega1 * omega2 * torch.cos(theta1 - theta2))
         # Potential energy
-        PE = - self.M1 * self.g * self.L1 * torch.cos(theta1) - self.M2 * self.g * (self.L1 * torch.cos(theta1) + self.L2 * torch.cos(theta2))
-        # Total energy at each timestep
-        E = KE + PE
-        # Conservation loss: squared deviation from initial energy
-        return E[1:] - E[0]
+        PE = -self.M1 * self.g * self.L1 * torch.cos(theta1) - \
+            self.M2 * self.g * (self.L1 * torch.cos(theta1) + self.L2 * torch.cos(theta2))
+        # Total energy
+        E = KE + PE  # (batch, T)
+        # Constraint residual: E[t] - E[0] for t >= 1
+        g = E[:, 1:] - E[:, 0:1]  # (batch, T-1)
+        return torch.norm(g, dim=1).mean().item()
+    
+    def energy_a(self, x):
+        traj = x.reshape(x.shape[0], -1, 4)  # (batch, T, 4)
+        theta1, omega1, theta2, omega2 = traj.unbind(dim=-1)  # each (batch, T)
+        # Kinetic energy
+        KE = 0.5 * self.M1 * self.L1**2 * omega1**2 + \
+            0.5 * self.M2 * (self.L1**2 * omega1**2 + self.L2**2 * omega2**2 + 
+                        2 * self.L1 * self.L2 * omega1 * omega2 * torch.cos(theta1 - theta2))
+        # Potential energy
+        PE = -self.M1 * self.g * self.L1 * torch.cos(theta1) - \
+            self.M2 * self.g * (self.L1 * torch.cos(theta1) + self.L2 * torch.cos(theta2))
+        # Total energy
+        E = KE + PE  # (batch, T)
+        # Constraint residual: E[t] - E[0] for t >= 1
+        g = E[:, 1:] - E[:, 0:1]  # (batch, T-1)
+        # --- Compute Jacobian J of g w.r.t. x[:,4:] analytically ---
+        dE_dtheta1 = (self.M1 + self.M2) * self.g * self.L1 * torch.sin(theta1[:, 1:]) - \
+                    self.M2 * self.L1 * self.L2 * omega1[:, 1:] * omega2[:, 1:] * torch.sin(theta1[:, 1:] - theta2[:, 1:])
+        
+        dE_domega1 = self.M1 * self.L1**2 * omega1[:, 1:] + \
+                    self.M2 * (self.L1**2 * omega1[:, 1:] + self.L1 * self.L2 * omega2[:, 1:] * torch.cos(theta1[:, 1:] - theta2[:, 1:]))
+        
+        dE_dtheta2 = self.M2 * self.g * self.L2 * torch.sin(theta2[:, 1:]) + \
+                    self.M2 * self.L1 * self.L2 * omega1[:, 1:] * omega2[:, 1:] * torch.sin(theta1[:, 1:] - theta2[:, 1:])
+        
+        dE_domega2 = self.M2 * (self.L2**2 * omega2[:, 1:] + self.L1 * self.L2 * omega1[:, 1:] * torch.cos(theta1[:, 1:] - theta2[:, 1:]))
+        # Stack into (batch, T-1, 4)
+        dE_dx = torch.stack([dE_dtheta1, dE_domega1, dE_dtheta2, dE_domega2], dim=-1)
+        # J^T @ g: for each timestep i in [1, T-1], a[i*4:(i+1)*4] = dE_dx[i-1] * g[i-1]
+        # Shape: (batch, T-1, 4)
+        Jt_g = dE_dx * g.unsqueeze(-1)  # (batch, T-1, 4)
+        # Flatten to (batch, (T-1)*4) matching x[:,4:]
+        return normalize(Jt_g.reshape(x.shape[0], -1)) # (batch, (T-1)*4)
 
     def visualize(self,traj):
         x1 = self.L1 * torch.sin(traj[:, 0]).detach().cpu().numpy()
