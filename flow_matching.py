@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import minari
 import time
+import math
 
 # Import from the local dynamics.py file
 try:
@@ -35,10 +36,13 @@ except ImportError:
 # --- Global Defaults ---
 torch.manual_seed(42)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS = 100
-BATCH_SIZE = 128
-LEARNING_RATE = 1e-4
-HIDDEN_DIM = 512
+TRAINING_STEPS = 100_000
+BATCH_SIZE = 256
+LEARNING_RATE = 2e-4
+# Transformer Hyperparameters
+HIDDEN_DIM = 256
+NUM_LAYERS = 4
+NUM_HEADS = 4
 CONST_T = 0.5
 
 # ==========================================
@@ -47,7 +51,7 @@ CONST_T = 0.5
 CONFIGS = {
     'hopper': {
         'dataset_id': 'mujoco/hopper/medium-v0',
-        'horizon': 100,
+        'horizon': 32, # Full episode length
         'obs_dim': 11,
         'act_dim': 3,
         'dynamics_path': 'model_weights/mujoco_hopper_medium-v0_dynamics.pth',
@@ -56,7 +60,7 @@ CONFIGS = {
     },
     'walker2d': {
         'dataset_id': 'mujoco/walker2d/medium-v0',
-        'horizon': 50,
+        'horizon': 32, # Full episode length
         'obs_dim': 17,
         'act_dim': 6,
         'dynamics_path': 'model_weights/mujoco_walker2d_medium-v0_dynamics.pth',
@@ -65,7 +69,7 @@ CONFIGS = {
     },
     'maze2d-umaze': {
         'dataset_id': 'D4RL/pointmaze/umaze-v2', 
-        'horizon': 100, 
+        'horizon': 64, # Standard Diffuser horizon for Umaze
         'obs_dim': 4, # [x, y, vx, vy]
         'act_dim': 2,
         'dynamics_path': 'model_weights/D4RL_pointmaze_umaze-v2_dynamics.pth',
@@ -81,7 +85,7 @@ CONFIGS = {
     },
     'maze2d-large': {
         'dataset_id': 'D4RL/pointmaze/large-v2',
-        'horizon': 384, # Extended horizon for large maze
+        'horizon': 128, # Standard Diffuser horizon for Large
         'obs_dim': 4,
         'act_dim': 2,
         'dynamics_path': 'model_weights/D4RL_pointmaze_large-v2_dynamics.pth',
@@ -281,7 +285,7 @@ class SADConstraintFunction(nn.Module):
         g_dyn = (actual_delta_norm - pred_delta_norm).reshape(batch_size, -1)
 
         # return torch.cat([g_a, g_s, g_dyn], dim=1)
-        return torch.cat([g_a, g_s], dim=1)
+        return torch.cat([g_a, g_s, g_dyn], dim=1)
 
 # ==========================================
 # 3. CONSTRAINED VECTOR FIELD (PDF Formula)
@@ -309,18 +313,18 @@ def compute_constrained_velocity(flow_model, x, t, constraint_fn, T_thresh=CONST
         return v_theta if training else v_theta.detach()
 
     # 2. Compute Constraints
-    g_val = constraint_fn(x_in)
+    g_s, g_a = constraint_fn._adm_safety_constraints(x_in.view(x_in.shape[0], constraint_fn.horizon, -1))
     
     # 3. Gradient 'a' = J^T * g
-    constraint_energy = 0.5 * torch.sum(g_val**2, dim=1).sum()
+    constraint_energy = 0.5 * torch.sum(torch.cat([g_a, g_s], dim=1)**2, dim=1).sum()
     
     a = torch.autograd.grad(constraint_energy, x_in, create_graph=False)[0]
     
     # 4. Projection
     a_norm_val = torch.norm(a, dim=1, keepdim=True) + 1e-8
     a_tilde = a / a_norm_val
-    rho_t = torch.exp(5.0 * t_tensor)
-    
+    rho_t = torch.exp(4.0 * t_tensor)
+
     # 5. Inner Product <\tilde{a}, v_theta>
     av_dot = torch.sum(a_tilde * v_theta, dim=1, keepdim=True)
     
@@ -336,26 +340,128 @@ def compute_constrained_velocity(flow_model, x, t, constraint_fn, T_thresh=CONST
         return v_constrained.detach()
 
 # ==========================================
-# 4. FLOW MODEL & UTILS
+# 4. TRANSFORMER FLOW MODEL
 # ==========================================
 
-class FlowNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim=512):
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim + 1, hidden_dim), 
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, input_dim)
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
         )
 
-    def forward(self, t, x):
-        if t.dim() == 1: t = t.unsqueeze(1)
-        if t.shape[0] != x.shape[0]: t = t.repeat(x.shape[0], 1)
-        return self.net(torch.cat([x, t], dim=-1))
+    def forward(self, x):
+        # x: [Batch, Seq, Dim]
+        attn_out, _ = self.attn(x, x, x)
+        x = self.norm1(x + attn_out)
+        mlp_out = self.mlp(x)
+        x = self.norm2(x + mlp_out)
+        return x
+
+class TransformerFlowModel(nn.Module):
+    """
+    Transformer-based Flow Model.
+    Replaces the previous MLP-based FlowNetwork.
+    
+    Structure:
+    1. Input Embedding (x_traj -> hidden)
+    2. Positional Embedding (Sequence pos + Diffusion time)
+    3. Transformer Encoder Blocks
+    4. Output Projection (hidden -> v_traj)
+    """
+    def __init__(self, obs_dim, act_dim, horizon, hidden_dim=256, num_layers=4, num_heads=4):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.horizon = horizon
+        self.input_dim = obs_dim + act_dim
+        self.hidden_dim = hidden_dim
+
+        # Input Projection
+        self.input_proj = nn.Linear(self.input_dim, hidden_dim)
+
+        # Time Embedding (for diffusion time t)
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # Sequence Positional Embedding (for trajectory steps 0...H)
+        self.pos_emb = nn.Parameter(torch.zeros(1, horizon, hidden_dim))
+
+        # Transformer Blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(hidden_dim, num_heads) for _ in range(num_layers)
+        ])
+
+        # Output Projection
+        self.output_proj = nn.Linear(hidden_dim, self.input_dim)
+        
+        # Initialize Positional Embeddings
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+    def forward(self, t, x_flat):
+        """
+        Args:
+            t: Diffusion time [Batch, 1] or [Batch]
+            x_flat: Flattened trajectory [Batch, Horizon * (Obs+Act)]
+        Returns:
+            v_flat: Flattened velocity [Batch, Horizon * (Obs+Act)]
+        """
+        batch_size = x_flat.shape[0]
+
+        # 1. Reshape Input: [B, H*D] -> [B, H, D]
+        x = x_flat.view(batch_size, self.horizon, self.input_dim)
+
+        # 2. Embed Trajectory
+        x_emb = self.input_proj(x) # [B, H, Hidden]
+
+        # 3. Add Sequence Positional Embeddings
+        x_emb = x_emb + self.pos_emb # Broadcasts to batch
+
+        # 4. Process Diffusion Time 't'
+        if t.dim() == 1: t = t.unsqueeze(1) # [B, 1]
+        if t.dim() == 2 and t.shape[1] == 1:
+            t_emb = self.time_mlp(t.squeeze(1)) # [B, Hidden]
+        else:
+            t_emb = self.time_mlp(t)
+        
+        # 5. Condition: Add time embedding to every sequence token
+        # (Alternative: Concat t_emb as a token, but adding is standard in DiT/Adan)
+        x_emb = x_emb + t_emb.unsqueeze(1) 
+
+        # 6. Transformer Passes
+        for block in self.blocks:
+            x_emb = block(x_emb)
+
+        # 7. Output Projection
+        v = self.output_proj(x_emb) # [B, H, Input_Dim]
+
+        # 8. Flatten Output: [B, H, D] -> [B, H*D]
+        v_flat = v.view(batch_size, -1)
+        
+        return v_flat
 
 def get_trajectory_dataloader(dataset_id, horizon, obs_dim, act_dim, batch_size, dynamics_path):
     print(f"Loading Dataset: {dataset_id}...")
@@ -402,7 +508,7 @@ def get_trajectory_dataloader(dataset_id, horizon, obs_dim, act_dim, batch_size,
                 trajectories = process_episodes(dataset.iterate_episodes())
             except Exception as e:
                 # Fallback logic if user provides D4RL ID but not Minari
-                raise ValueError(f"Dataset {dataset_id} not found in Minari registry: {e}")
+                raise ValueError(f"Dataset {dataset_id} not found in M_(True)")
 
         if len(trajectories) == 0: raise ValueError("No valid trajectories found in dataset")
         trajectories = np.array(trajectories, dtype=np.float32)
@@ -468,7 +574,11 @@ def main():
 
     print(f"\n=== Training Configuration: {args.env.upper()} ===")
     print(f"Dataset: {cfg['dataset_id']}")
-    print(f"Obstacles: {len(cfg.get('safety_thresholds', {}).get('obstacles', []))}")
+    
+    # Fix: Calculate obstacle count outside f-string to avoid syntax highlighting issues with nested {}
+    num_obstacles = len(cfg.get('safety_thresholds', {}).get('obstacles', []))
+    print(f"Obstacles: {num_obstacles}")
+    
     print(f"Action Bounds: {cfg.get('action_bounds', 'Default')}")
     print("========================================\n")
 
@@ -477,16 +587,28 @@ def main():
         cfg['dataset_id'], cfg['horizon'], cfg['obs_dim'], cfg['act_dim'], BATCH_SIZE, cfg['dynamics_path']
     )
 
-    # 2. Initialize Models
-    traj_dim = cfg['horizon'] * (cfg['obs_dim'] + cfg['act_dim'])
-    flow_net = FlowNetwork(input_dim=traj_dim, hidden_dim=HIDDEN_DIM).to(DEVICE)
+    # 2. Initialize Models (TRANSFORMER REPLACEMENT)
+    # Note: input_dim for Transformer logic is handled inside the class, we pass obs/act dim separately
+    flow_net = TransformerFlowModel(
+        obs_dim=cfg['obs_dim'], 
+        act_dim=cfg['act_dim'], 
+        horizon=cfg['horizon'],
+        hidden_dim=HIDDEN_DIM,
+        num_layers=NUM_LAYERS,
+        num_heads=NUM_HEADS
+    ).to(DEVICE)
+    
     optimizer = optim.Adam(flow_net.parameters(), lr=LEARNING_RATE)
-    constraints = SADConstraintFunction(cfg, DEVICE)
+    # constraints = SADConstraintFunction(cfg, DEVICE)
     
     # 3. CFM Optimizer
     FM = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
 
-    print("Starting Training...")
+    print(f"Starting Training with Transformer (Dim: {HIDDEN_DIM}, Layers: {NUM_LAYERS})...")
+    
+    traj_dim_flat = cfg['horizon'] * (cfg['obs_dim'] + cfg['act_dim']) # For sanity check shape later
+    
+    EPOCHS = math.ceil(TRAINING_STEPS / len(dataloader))
     for epoch in range(EPOCHS):
         flow_net.train()
         epoch_loss = 0
@@ -497,11 +619,12 @@ def main():
             t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
             
             # Use Constrained Velocity for Prediction (Training Time)
-            vt_pred = compute_constrained_velocity(
-                flow_net, xt, t, constraints, 
-                T_thresh=CONST_T,
-                training=True 
-            )
+            vt_pred = flow_net(t, xt)
+            # vt_pred = compute_constrained_velocity(
+            #     flow_net, xt, t, constraints, 
+            #     T_thresh=CONST_T,
+            #     training=True 
+            # )
             
             loss = torch.mean((vt_pred - ut) ** 2)
             
@@ -510,23 +633,22 @@ def main():
             optimizer.step()
             epoch_loss += loss.item()
 
-        if (epoch+1) % 10 == 0:
-            avg_loss = epoch_loss / len(dataloader)
-            print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.6f}")
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.6f}")
             
             # Quick sanity check of constraint field strength
-            with torch.no_grad():
-                x_sample = torch.randn(1, traj_dim, device=DEVICE)
-                t_sample = torch.tensor([0.9], device=DEVICE)
-                v_base = flow_net(t_sample, x_sample)
-                with torch.enable_grad():
-                    v_constrained = compute_constrained_velocity(
-                        flow_net, x_sample, t_sample, constraints, 
-                        T_thresh=CONST_T, training=False
-                    )
-                diff = (v_base - v_constrained).norm().item()
-                if diff > 1e-5:
-                    print(f"  > Constraint Correction Active: {diff:.4f}")
+            # with torch.no_grad():
+            #     x_sample = torch.randn(1, traj_dim_flat, device=DEVICE)
+            #     t_sample = torch.tensor([0.9], device=DEVICE)
+            #     v_base = flow_net(t_sample, x_sample)
+            #     with torch.enable_grad():
+            #         v_constrained = compute_constrained_velocity(
+            #             flow_net, x_sample, t_sample, constraints, 
+            #             T_thresh=CONST_T, training=False
+            #         )
+            #     diff = (v_base - v_constrained).norm().item()
+            #     if diff > 1e-5:
+            #         print(f"  > Constraint Correction Active: {diff:.4f}")
 
     if 'mujoco' in cfg['dataset_id']:
         save_name = f"model_weights/flow_model_{args.env}_{args.level}.pth"

@@ -6,7 +6,7 @@ import minari
 from collections import defaultdict
 
 # Import your local modules
-from flow_matching import FlowNetwork, SADConstraintFunction, compute_constrained_velocity, CONFIGS, get_trajectory_dataloader
+from flow_matching import TransformerFlowModel, SADConstraintFunction, compute_constrained_velocity, CONFIGS, get_trajectory_dataloader
 from dynamics import DynamicsModel, StandardScaler
 
 # Configuration
@@ -255,7 +255,11 @@ def main():
     # Load Models
     constraints = SADConstraintFunction(cfg, DEVICE)
     traj_dim = cfg['horizon'] * (cfg['obs_dim'] + cfg['act_dim'])
-    flow_net = FlowNetwork(input_dim=traj_dim, hidden_dim=512).to(DEVICE)
+    flow_net = TransformerFlowModel(
+        obs_dim=cfg['obs_dim'], 
+        act_dim=cfg['act_dim'], 
+        horizon=cfg['horizon']
+    ).to(DEVICE)
     if os.path.exists(args.model_path):
         flow_net.load_state_dict(torch.load(args.model_path, map_location=DEVICE))
     else:
