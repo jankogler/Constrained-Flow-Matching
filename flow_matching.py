@@ -36,14 +36,14 @@ except ImportError:
 # --- Global Defaults ---
 torch.manual_seed(42)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-TRAINING_STEPS = 100_000
+TRAINING_STEPS = 10_000
 BATCH_SIZE = 256
 LEARNING_RATE = 2e-4
 # Transformer Hyperparameters
 HIDDEN_DIM = 256
 NUM_LAYERS = 4
 NUM_HEADS = 4
-CONST_T = 0.5
+CONST_T = 0.2
 
 # ==========================================
 # 1. CONFIGURATION DICTIONARY
@@ -246,10 +246,14 @@ class SADConstraintFunction(nn.Module):
 
         return g_safe, g_adm
 
-    def forward(self, trajectory_flat):
+    def forward(self, trajectory_flat, metrics_mode=False):
         """
         Calculates the constraint vector g(T).
-        Returns: [Batch, num_constraints]
+        Args:
+            trajectory_flat: Flattened trajectory
+            metrics_mode (bool): If True, returns UNNORMALIZED (physical) dynamics errors
+                                 for benchmarking. If False, returns NORMALIZED errors
+                                 for gradient calculation/training.
         """
         batch_size = trajectory_flat.shape[0]
         traj = trajectory_flat.view(batch_size, self.horizon, self.obs_dim + self.act_dim)
@@ -265,42 +269,61 @@ class SADConstraintFunction(nn.Module):
         a_t_norm = actions_norm[:, :-1, :]
         s_t1_norm_target = states_norm[:, 1:, :]
         
-        # 1. Model Prediction
+        # 1. Model Prediction (Predicted Delta in NORMALIZED space)
         pred_delta_norm = self.dyn_model(s_t_norm, a_t_norm)
         
-        # 2. Actual Delta (Careful unnormalization logic)
+        # 2. Get Scaler Stats
         obs_mean = self.scaler_obs.mean.view(1, 1, -1)
         obs_std = self.scaler_obs.std.view(1, 1, -1)
         delta_mean = self.scaler_delta.mean.view(1, 1, -1)
         delta_std = self.scaler_delta.std.view(1, 1, -1)
 
-        s_t_real = s_t_norm * obs_std + obs_mean
-        s_t1_real_target = s_t1_norm_target * obs_std + obs_mean
-        
-        actual_delta_real = s_t1_real_target - s_t_real
-        
-        # 3. Re-normalize using DELTA scaler
-        actual_delta_norm = (actual_delta_real - delta_mean) / delta_std
-        
-        g_dyn = (actual_delta_norm - pred_delta_norm).reshape(batch_size, -1)
+        if metrics_mode:
+            # === BENCHMARKING MODE (Physical Units) ===
+            
+            # Convert Predicted Delta to Physical Space
+            pred_delta_real = (pred_delta_norm * delta_std) + delta_mean
+            
+            # Convert Target States to Physical Space
+            s_t_real = (s_t_norm * obs_std) + obs_mean
+            s_t1_real_target = (s_t1_norm_target * obs_std) + obs_mean
+            
+            # Calculate Physical Actual Delta
+            actual_delta_real = s_t1_real_target - s_t_real
+            
+            # Error = Difference in Real Physical Units (e.g., meters)
+            # We treat this as a simple L1 or L2 difference for reporting
+            g_dyn = (actual_delta_real - pred_delta_real).reshape(batch_size, -1)
+            
+        else:
+            # === TRAINING MODE (Normalized Gradients) ===
+            # (Original Logic: Keeps gradients scaled nicely for the optimizer)
+            
+            s_t_real = s_t_norm * obs_std + obs_mean
+            s_t1_real_target = s_t1_norm_target * obs_std + obs_mean
+            actual_delta_real = s_t1_real_target - s_t_real
+            
+            # Re-normalize actual delta to compare with model output
+            actual_delta_norm = (actual_delta_real - delta_mean) / delta_std
+            g_dyn = (actual_delta_norm - pred_delta_norm).reshape(batch_size, -1)
 
-        # return torch.cat([g_a, g_s, g_dyn], dim=1)
         return torch.cat([g_a, g_s, g_dyn], dim=1)
-
+        
 # ==========================================
 # 3. CONSTRAINED VECTOR FIELD (PDF Formula)
 # ==========================================
 
-def compute_constrained_velocity(flow_model, x, t, constraint_fn, T_thresh=CONST_T, training=False):
+def compute_constrained_velocity(flow_model, x, t, constraint_fn, T_thresh=0.0, training=False):
     """
-    Implements the constrained velocity field \tilde{v} from the PDF (Section 1.2).
+    Revised velocity calculation that explicitly includes DYNAMICS in the energy term.
     """
-    x_in = x.detach() 
+    x_in = x.detach()
     x_in.requires_grad_(True)
     
+    # Handle scalar vs tensor time
     if isinstance(t, (float, int)):
-        t_val = t
         t_tensor = torch.tensor([t], device=x.device).float()
+        t_val = t
     else:
         t_val = t.item() if t.numel() == 1 else t[0].item()
         t_tensor = t
@@ -308,30 +331,36 @@ def compute_constrained_velocity(flow_model, x, t, constraint_fn, T_thresh=CONST
     # 1. Base Velocity
     v_theta = flow_model(t_tensor, x_in)
     
-    # If before T_thresh, return base velocity
+    # Early exit if before threshold
     if t_val < T_thresh:
         return v_theta if training else v_theta.detach()
 
-    # 2. Compute Constraints
-    g_s, g_a = constraint_fn._adm_safety_constraints(x_in.view(x_in.shape[0], constraint_fn.horizon, -1))
+    # 2. Compute ALL Constraints (Safety + Admissibility + Dynamics)
+    # metrics_mode=False returns normalized gradients suitable for optimization
+    g_all = constraint_fn(x_in, metrics_mode=False) 
     
-    # 3. Gradient 'a' = J^T * g
-    constraint_energy = 0.5 * torch.sum(torch.cat([g_a, g_s], dim=1)**2, dim=1).sum()
+    # 3. Compute Energy (Sum of Squares of ALL constraints)
+    constraint_energy = 0.5 * torch.sum(g_all**2, dim=1).sum()
     
+    # 4. Compute Gradient 'a'
+    # This now directs the flow to satisfy physics AND safety
     a = torch.autograd.grad(constraint_energy, x_in, create_graph=False)[0]
     
-    # 4. Projection
+    # 5. Projection
     a_norm_val = torch.norm(a, dim=1, keepdim=True) + 1e-8
     a_tilde = a / a_norm_val
+    
+    # === FIX: Ensure t_tensor is [Batch, 1] ===
+    if t_tensor.dim() == 1:
+        t_tensor = t_tensor.view(-1, 1)
+        
     rho_t = torch.exp(4.0 * t_tensor)
 
-    # 5. Inner Product <\tilde{a}, v_theta>
     av_dot = torch.sum(a_tilde * v_theta, dim=1, keepdim=True)
     
-    # Correction: (max{<a,v>, 0} + rho(t))
+    # Now this addition is valid: [B, 1] + [B, 1] -> [B, 1]
     correction_scalar = torch.clamp(av_dot, min=0.0) + rho_t
     
-    # \tilde{v} = v - correction * \tilde{a}
     v_constrained = v_theta - (correction_scalar * a_tilde)
     
     if training:
@@ -599,7 +628,7 @@ def main():
     ).to(DEVICE)
     
     optimizer = optim.Adam(flow_net.parameters(), lr=LEARNING_RATE)
-    # constraints = SADConstraintFunction(cfg, DEVICE)
+    constraints = SADConstraintFunction(cfg, DEVICE)
     
     # 3. CFM Optimizer
     FM = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
@@ -619,12 +648,12 @@ def main():
             t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
             
             # Use Constrained Velocity for Prediction (Training Time)
-            vt_pred = flow_net(t, xt)
-            # vt_pred = compute_constrained_velocity(
-            #     flow_net, xt, t, constraints, 
-            #     T_thresh=CONST_T,
-            #     training=True 
-            # )
+            # vt_pred = flow_net(t, xt)
+            vt_pred = compute_constrained_velocity(
+                flow_net, xt, t, constraints, 
+                T_thresh=CONST_T,
+                training=True 
+            )
             
             loss = torch.mean((vt_pred - ut) ** 2)
             
